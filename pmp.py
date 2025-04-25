@@ -5,6 +5,7 @@ import pandas as pd
 import matplotlib
 import openpyxl
 from scipy.integrate import quad, simpson
+from scipy.integrate import odeint
 from matplotlib.colors import PowerNorm
 
 class ParticleMeshSimulation:
@@ -31,10 +32,8 @@ class ParticleMeshSimulation:
         self.lna = cp.log(self.a)
         self.box_size = 1.0
 
-
-
     def initial_positions(self):
-        q = cp.linspace(0, self.grid_size, self.grid_size, endpoint=False) + 0.5
+        q = cp.linspace(0, self.grid_size, self.grid_size, endpoint=False)
         qx, qy, qz = cp.meshgrid(q, q, q, indexing='ij')
         self.positions = cp.column_stack((qx.ravel(), qy.ravel(), qz.ravel()))
         self.positions %= self.grid_size
@@ -49,11 +48,38 @@ class ParticleMeshSimulation:
                        self.omega_k * a**-2 + self.omega_lambda)
 
     def growth_factor(self, a=None):
-        return a if a is not None else self.a
+        a = a if a is not None else self.a
+        def growth_equation(D, lna, omega_m, omega_r, omega_k, omega_lambda):
+            a = np.exp(lna)
+            E2 = omega_r * a**-4 + omega_m * a**-3 + omega_k * a**-2 + omega_lambda
+            Omega_m_a = omega_m * a**-3 / E2
+            dH_over_H2 = -0.5 * (4 * omega_r * a**-4 + 3 * omega_m * a**-3 + 2 * omega_k * a**-2) / E2
+            dD_dlna = D[1]
+            d2D_dlna2 = 1.5 * Omega_m_a * D[0] - (2 + dH_over_H2) * D[1]
+            return [dD_dlna, d2D_dlna2]
+        omega_m = self.omega_m
+        omega_r = self.omega_r
+        omega_k = self.omega_k
+        omega_lambda = self.omega_lambda
+        a_init = 1e-3
+        lna = np.linspace(np.log(a_init), 0, 100)
+        a_vals = np.exp(lna)
+        D0 = a_init
+        dD_dlna0 = D0
+        initial_conditions = [D0, dD_dlna0]
+        sol = odeint(growth_equation, initial_conditions, lna, 
+                     args=(omega_m, omega_r, omega_k, omega_lambda))
+        D = sol[:, 0]
+        D /= D[-1]
+        return np.interp(np.log(a), lna, D)
 
     def growth_rate(self, a=None):
         a = a if a is not None else self.a
-        return (self.omega_m * a**-3 / self.E(a)**2)**0.55
+        delta_a = 1e-6
+        D1 = self.growth_factor(a)
+        D2 = self.growth_factor(a + delta_a)
+        return np.log(D2 / D1) / np.log((a + delta_a) / a)
+
 
     def transfer_function(self, k):
         gamma = self.omega_m * self.h * np.exp(-self.omega_b * (1 + np.sqrt(2 * self.h) / self.omega_m))
@@ -77,7 +103,7 @@ class ParticleMeshSimulation:
         A = self.sigma8**2 / I
         
         T = cp.array([self.transfer_function(k) for k in ks])
-        return A * T**2 * ks**self.ns * self.a
+        return A * T**2 * ks**self.ns
 
     def zeldovich(self, delta_a=0.01):
         k_freq = 2 * np.pi * cp.fft.fftfreq(self.grid_size, d=1/self.grid_size)
@@ -85,11 +111,9 @@ class ParticleMeshSimulation:
         k_mag = np.sqrt(kx**2 + ky**2 + kz**2)
         k_mag[0,0,0] = 1.0
 
-        rand_real = cp.random.normal(0, 1/np.sqrt(2), (self.grid_size, self.grid_size, self.grid_size))
-        rand_imag = cp.random.normal(0, 1/np.sqrt(2), (self.grid_size, self.grid_size, self.grid_size))
+        rand_real = cp.random.normal(0, 1, (self.grid_size, self.grid_size, self.grid_size))
+        rand_imag = cp.random.normal(0, 1, (self.grid_size, self.grid_size, self.grid_size))
         delta_k = (rand_real + 1j * rand_imag)
-
-        # Enforce Hermitian symmetry (to ensure real-valued field in real space)
         delta_k = 0.5 * (delta_k + cp.conj(delta_k[::-1, ::-1, ::-1]))
         
         P_k = self.power_spectrum(k_mag)
@@ -97,16 +121,16 @@ class ParticleMeshSimulation:
         
         phi_k = -delta_k / (k_mag**2)
         phi_k[0,0,0] = 0
-        psi_x = cp.fft.ifftn(1j * kx * phi_k).real
-        psi_y = cp.fft.ifftn(1j * ky * phi_k).real
-        psi_z = cp.fft.ifftn(1j * kz * phi_k).real
+        psi_x = cp.fft.ifftn(-1j * kx * phi_k).real
+        psi_y = cp.fft.ifftn(-1j * ky * phi_k).real
+        psi_z = cp.fft.ifftn(-1j * kz * phi_k).real
 
         D = self.growth_factor()
         f = self.growth_rate()
         Hz = self.hubble()
 
         displacements = D * cp.column_stack([psi_x.ravel(), psi_y.ravel(), psi_z.ravel()])
-        self.positions -= displacements
+        self.positions += displacements
         self.positions %= self.grid_size
 
         self.velocities = -(f * Hz) * displacements
@@ -191,7 +215,7 @@ class ParticleMeshSimulation:
         self.force_grid[2, :, :, -1] = self.force_grid[2, :, :, 0]
 
     def update_velocity(self, delta_ln_a):
-        const = 1.5 / (self.a * self.E(self.a)) * (delta_ln_a / 2) * np.exp(self.lna)
+        const = 1.5 * self.hubble() * 100 / (self.a * self.E(self.a)) * (delta_ln_a / 2) * np.exp(self.lna)
         pos_floor = cp.floor(self.positions).astype(cp.int32)
         dxdyz = self.positions - pos_floor
 
